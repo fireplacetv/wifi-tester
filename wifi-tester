@@ -34,7 +34,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-[ "$(uname -s)" = Darwin ] || { echo "wifi-tester is written for macOS." >&2; exit 1; }
+# Sections, in order: options, output helpers, numeric helpers, shared probes,
+# platform probes, report logic, throughput test, verdict. Anything tagged
+# "platform:" needs its own implementation for each supported OS.
+OS=$(uname -s)
+[ "$OS" = Darwin ] || { echo "wifi-tester is written for macOS." >&2; exit 1; }
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/wifi-tester.XXXXXX") || exit 1
 trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$TMP"' EXIT
@@ -46,6 +50,7 @@ else
   C_OK=""; C_WARN=""; C_FAIL=""; C_DIM=""; C_BOLD=""; C_OFF=""
 fi
 
+# ---- Output helpers ----
 say() { [ "$QUIET" -eq 0 ] && printf '%s\n' "$*"; return 0; }
 
 # row LEVEL CHECK DETAIL: one line of the results table; WARN/FAIL count as issues.
@@ -65,6 +70,7 @@ row() {
 DIAG=()
 add_diag() { DIAG[${#DIAG[@]}]="$1"; }
 
+# ---- Numeric and address helpers ----
 # Float comparisons: gt A B  -> A > B ; lt A B -> A < B
 gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 > b + 0) }'; }
 lt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 < b + 0) }'; }
@@ -82,6 +88,7 @@ is_private() {
 # the results are sourced afterwards. Values are %q-quoted where they hold text.
 # ---------------------------------------------------------------------------
 
+# platform: macOS (system_profiler). Linux will use iw or nmcli.
 # Current network name. macOS prints <redacted> unless the terminal app has
 # Location Services permission. Read before the header so it prints first.
 current_ssid() {
@@ -90,6 +97,7 @@ current_ssid() {
     sed -n '2p' | sed 's/^ *//; s/:$//'
 }
 
+# platform: macOS (system_profiler). Linux will use iw or nmcli.
 # Wi-Fi radio: signal/noise, channel, PHY mode, link rate.
 probe_wifi() {
   local info block rssi noise chan phy rate
@@ -139,6 +147,8 @@ dns_fields() { # OUTPUT_OF_DIG PREFIX
   printf '%s_ADDR=%q\n' "$2" "$addr"
 }
 
+# platform: the system resolver lookup (scutil, macOS) is platform-specific.
+# The dig queries are portable.
 # DNS: system resolver vs. 1.1.1.1, same name.
 probe_dns() {
   local ns s p
@@ -200,11 +210,13 @@ DNS_NS=""; DNS_SYS_STATUS=NONE; DNS_SYS_MS=-1; DNS_SYS_ADDR=""
 DNS_PUB_STATUS=NONE; DNS_PUB_MS=-1; DNS_PUB_ADDR=""
 CAP_APPLE=fail; CAP_GSTATIC=000; HTTP_TTFB=-1; HTTP_CODE=000; TLS_ISSUER=""; V6=none
 
+# platform: BSD route syntax. Linux will use "ip route show default".
 GW=$(route -n get default 2>/dev/null | awk '/gateway:/ { print $2; exit }')
 
 # ---------------------------------------------------------------------------
 # Run the light checks in parallel.
 # ---------------------------------------------------------------------------
+# platform: macOS (ipconfig, networksetup, arp). Linux will use nmcli, ip and resolvectl.
 # Details macOS doesn't redact: gateway MAC, DHCP domain, IPv6 prefix, security,
 # and the router model (ISPs put it in DHCP option 125). Quick, local reads only.
 network_details() {
@@ -430,6 +442,7 @@ to_ms() {
   awk '{ v = $1 + 0; if ($2 ~ /^s/) v *= 1000; printf "%.0f\n", v }' <<< "$1"
 }
 
+# platform: macOS networkQuality. Linux has no built-in equivalent.
 run_speed() {
   say ""
   say "Running throughput test (about 15s, uses the full link)..."
