@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+# wifi-tester: diagnose slow or flaky public Wi-Fi on macOS.
+#
+# Runs light, layered checks in parallel (Wi-Fi radio -> router -> internet ->
+# DNS -> captive portal / TLS inspection -> ports), optionally a short
+# throughput test, then prints a verdict. Uses only built-in macOS tools.
+set -u
+
+SPEED_MODE=ask   # ask | yes | no
+QUIET=0
+
+usage() {
+  cat <<'EOF'
+Usage: wifi-tester [options]
+
+  --speed       run the throughput test (~15s, saturates the link)
+  --no-speed    skip the throughput test without prompting
+  -q, --quiet   print only the verdict
+  -h, --help    show this help
+
+The light checks send only a few hundred bytes. The throughput test is the
+only step that loads the connection, so it asks first unless you pass a flag.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --speed)    SPEED_MODE=yes ;;
+    --no-speed) SPEED_MODE=no ;;
+    -q|--quiet) QUIET=1 ;;
+    -h|--help)  usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ "$(uname -s)" = Darwin ] || { echo "wifi-tester is written for macOS." >&2; exit 1; }
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/wifi-tester.XXXXXX") || exit 1
+trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$TMP"' EXIT
+
+if [ -t 1 ] && [ "$QUIET" -eq 0 ]; then
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_FAIL=$'\033[31m'
+  C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_OK=""; C_WARN=""; C_FAIL=""; C_DIM=""; C_BOLD=""; C_OFF=""
+fi
+
+say() { [ "$QUIET" -eq 0 ] && printf '%s\n' "$*"; return 0; }
+
+# row LEVEL CHECK DETAIL: one line of the results table; WARN/FAIL count as issues.
+ISSUES=0
+row() {
+  local c="$C_OK"
+  case "$1" in
+    WARN) c="$C_WARN"; ISSUES=$((ISSUES + 1)) ;;
+    FAIL) c="$C_FAIL"; ISSUES=$((ISSUES + 1)) ;;
+    SKIP|INFO) c="$C_DIM" ;;
+  esac
+  [ "$QUIET" -eq 0 ] && printf '  %s%-4s%s  %-14s %s\n' "$c" "$1" "$C_OFF" "$2" "$3"
+  return 0
+}
+
+# Likely causes, in the order they were found. Printed in the verdict.
+DIAG=()
+add_diag() { DIAG[${#DIAG[@]}]="$1"; }
+
+# Float comparisons: gt A B  -> A > B ; lt A B -> A < B
+gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 > b + 0) }'; }
+lt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 < b + 0) }'; }
+
+# RFC1918, loopback, link-local, and "this network" addresses.
+is_private() {
+  case "$1" in
+    10.*|192.168.*|127.*|169.254.*|0.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Probes. Each prints shell assignments on stdout; they run in parallel and
+# the results are sourced afterwards. Values are %q-quoted where they hold text.
+# ---------------------------------------------------------------------------
+
+# Current network name. macOS prints <redacted> unless the terminal app has
+# Location Services permission. Read before the header so it prints first.
+current_ssid() {
+  system_profiler SPAirPortDataType -detailLevel basic 2>/dev/null |
+    grep -A 14 'Current Network Information:' | head -n 15 |
+    sed -n '2p' | sed 's/^ *//; s/:$//'
+}
+
+# Wi-Fi radio: signal/noise, channel, PHY mode, link rate.
+probe_wifi() {
+  local info block rssi noise chan phy rate
+  info=$(system_profiler SPAirPortDataType -detailLevel basic 2>/dev/null)
+  block=$(printf '%s\n' "$info" | grep -A 14 'Current Network Information:' | head -n 15)
+  rssi=$(printf '%s\n' "$block" | sed -n 's/.*Signal \/ Noise: *\(-*[0-9]*\) dBm.*/\1/p' | head -n 1)
+  noise=$(printf '%s\n' "$block" | sed -n 's/.*Signal \/ Noise: .*\/ *\(-*[0-9]*\) dBm.*/\1/p' | head -n 1)
+  chan=$(printf '%s\n' "$block" | sed -n 's/^ *Channel: *//p' | head -n 1)
+  phy=$(printf '%s\n' "$block" | sed -n 's/^ *PHY Mode: *//p' | head -n 1)
+  rate=$(printf '%s\n' "$block" | sed -n 's/^ *Transmit Rate: *//p' | head -n 1)
+  printf 'WIFI_RSSI=%q\n' "$rssi"
+  printf 'WIFI_NOISE=%q\n' "$noise"
+  printf 'WIFI_CHAN=%q\n' "$chan"
+  printf 'WIFI_PHY=%q\n' "$phy"
+  printf 'WIFI_RATE=%q\n' "$rate"
+}
+
+# Latency, loss and jitter (stddev of RTT) over 20 pings at 200 ms.
+probe_ping() { # HOST PREFIX
+  local out loss rtt avg jit
+  out=$(ping -q -c 20 -i 0.2 -W 1000 "$1" 2>/dev/null)
+  loss=$(printf '%s\n' "$out" | sed -n 's/.*, \([0-9.]*\)% packet loss.*/\1/p')
+  rtt=$(printf '%s\n' "$out" | sed -n 's/.*= [0-9.]*\/\([0-9.]*\)\/[0-9.]*\/\([0-9.]*\) ms.*/\1 \2/p')
+  avg=${rtt%% *}
+  jit=${rtt##* }
+  printf '%s_LOSS=%s\n' "$2" "${loss:-100}"
+  printf '%s_AVG=%s\n' "$2" "${avg:--1}"
+  printf '%s_JIT=%s\n' "$2" "${jit:--1}"
+}
+
+# Can full-size (1500 byte) unfragmented packets cross the path?
+probe_mtu() {
+  if ping -q -c 3 -D -s 1472 -W 1000 1.1.1.1 >/dev/null 2>&1; then
+    echo "MTU_OK=1"
+  else
+    echo "MTU_OK=0"
+  fi
+}
+
+dns_fields() { # OUTPUT_OF_DIG PREFIX
+  local status ms addr
+  status=$(printf '%s\n' "$1" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -n 1)
+  ms=$(printf '%s\n' "$1" | awk '/Query time:/ { print $4; exit }')
+  addr=$(printf '%s\n' "$1" | awk '$4 == "A" { print $5; exit }')
+  printf '%s_STATUS=%s\n' "$2" "${status:-NONE}"
+  printf '%s_MS=%s\n' "$2" "${ms:--1}"
+  printf '%s_ADDR=%q\n' "$2" "$addr"
+}
+
+# DNS: system resolver vs. 1.1.1.1, same name.
+probe_dns() {
+  local ns s p
+  ns=$(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/ { print $3; exit }')
+  s=$(dig +tries=1 +time=3 example.com A 2>/dev/null)
+  p=$(dig +tries=1 +time=3 @1.1.1.1 example.com A 2>/dev/null)
+  printf 'DNS_NS=%q\n' "$ns"
+  dns_fields "$s" DNS_SYS
+  dns_fields "$p" DNS_PUB
+}
+
+# Captive portal, HTTPS timing, TLS issuer (inspection proxy?), IPv6 health.
+probe_http() {
+  local body code t ttfb total http_code global6 v6 issuer
+  body=$(curl -s -m 8 http://captive.apple.com/hotspot-detect.html 2>/dev/null)
+  case "$body" in
+    *Success*) echo "CAP_APPLE=ok" ;;
+    *)         echo "CAP_APPLE=fail" ;;
+  esac
+  code=$(curl -s -o /dev/null -m 8 -w '%{http_code}' http://connectivitycheck.gstatic.com/generate_204)
+  printf 'CAP_GSTATIC=%s\n' "$code"
+
+  t=$(curl -s -v -o /dev/null -m 8 \
+        -w '%{time_starttransfer} %{time_total} %{http_code}' \
+        https://www.cloudflare.com/cdn-cgi/trace 2>"$TMP/tls.log")
+  read -r ttfb total http_code <<< "$t"
+  printf 'HTTP_TTFB=%s\n' "${ttfb:--1}"
+  printf 'HTTP_CODE=%s\n' "${http_code:-000}"
+  issuer=$(sed -n 's/^\* *issuer: //p' "$TMP/tls.log" 2>/dev/null | head -n 1)
+  printf 'TLS_ISSUER=%q\n' "$issuer"
+
+  global6=$(ifconfig 2>/dev/null | awk '/inet6 / && $2 !~ /^fe80/ && $2 != "::1" { print $2; exit }')
+  v6=none
+  if [ -n "$global6" ]; then
+    code=$(curl -6 -s -o /dev/null -m 5 -w '%{http_code}' https://www.cloudflare.com/cdn-cgi/trace)
+    if [ "$code" = 200 ]; then v6=ok; else v6=broken; fi
+  fi
+  printf 'V6=%s\n' "$v6"
+}
+
+# Single TCP port reachability. Writes open|closed to $TMP/port.LABEL.
+probe_port() { # LABEL HOST PORT
+  if nc -z -w 3 "$2" "$3" >/dev/null 2>&1; then
+    echo open > "$TMP/port.$1"
+  else
+    echo closed > "$TMP/port.$1"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Defaults, so a probe that fails to report still leaves sane values.
+# ---------------------------------------------------------------------------
+WIFI_SSID=""; WIFI_RSSI=""; WIFI_NOISE=""; WIFI_CHAN=""; WIFI_PHY=""; WIFI_RATE=""
+GW_LOSS=100; GW_AVG=-1; GW_JIT=-1
+UP1_LOSS=100; UP1_AVG=-1; UP1_JIT=-1
+UP2_LOSS=100; UP2_AVG=-1; UP2_JIT=-1
+MTU_OK=0
+DNS_NS=""; DNS_SYS_STATUS=NONE; DNS_SYS_MS=-1; DNS_SYS_ADDR=""
+DNS_PUB_STATUS=NONE; DNS_PUB_MS=-1; DNS_PUB_ADDR=""
+CAP_APPLE=fail; CAP_GSTATIC=000; HTTP_TTFB=-1; HTTP_CODE=000; TLS_ISSUER=""; V6=none
+
+GW=$(route -n get default 2>/dev/null | awk '/gateway:/ { print $2; exit }')
+
+# ---------------------------------------------------------------------------
+# Run the light checks in parallel.
+# ---------------------------------------------------------------------------
+say "${C_BOLD}wifi-tester${C_OFF}  $(date '+%H:%M:%S')"
+WIFI_SSID=$(current_ssid)
+case "$WIFI_SSID" in
+  "") say "Network: not connected to Wi-Fi" ;;
+  "<redacted>") say "Network: hidden by macOS (allow Location Services for your terminal app to show it)" ;;
+  *) say "Network: $WIFI_SSID" ;;
+esac
+say "Running light checks (about 10s)..."
+
+probe_wifi > "$TMP/wifi.env" &
+if [ -n "$GW" ]; then probe_ping "$GW" GW > "$TMP/gw.env" & fi
+probe_ping 1.1.1.1 UP1 > "$TMP/up1.env" &
+probe_ping 8.8.8.8 UP2 > "$TMP/up2.env" &
+probe_mtu > "$TMP/mtu.env" &
+probe_dns > "$TMP/dns.env" &
+probe_http > "$TMP/http.env" &
+probe_port https www.cloudflare.com 443 &
+probe_port dns 1.1.1.1 53 &
+probe_port imaps imap.gmail.com 993 &
+probe_port submit smtp.gmail.com 587 &
+probe_port ssh github.com 22 &
+probe_port http example.com 80 &
+wait
+
+for f in "$TMP"/*.env; do . "$f"; done
+
+# ---------------------------------------------------------------------------
+# Reports. Each one prints a row and, when something is wrong, a likely cause.
+# ---------------------------------------------------------------------------
+GW_BAD=0      # router replies, but is lossy or slow
+GW_UNKNOWN=0  # router doesn't answer ping, so the radio hop can't be separated out
+UP_BAD=0
+
+report_wifi() {
+  if [ -z "$WIFI_RSSI" ]; then
+    row SKIP "Wi-Fi" "no signal data (macOS hides it when not associated)"
+    return
+  fi
+  local detail="${WIFI_RSSI} dBm, ${WIFI_CHAN:-channel ?}, ${WIFI_PHY:-PHY ?}"
+  if [ "$WIFI_RSSI" -le -75 ]; then
+    row FAIL "Wi-Fi signal" "$detail"
+    add_diag "Weak Wi-Fi signal. You're far from the access point or behind obstacles. Move closer or change position."
+  elif [ "$WIFI_RSSI" -le -70 ]; then
+    row WARN "Wi-Fi signal" "$detail"
+    add_diag "Marginal Wi-Fi signal. This drops rate and retries, which slows everything. Moving closer usually helps."
+  else
+    row PASS "Wi-Fi signal" "$detail"
+  fi
+
+  if [ -n "$WIFI_NOISE" ]; then
+    local snr=$(( WIFI_RSSI - WIFI_NOISE ))
+    if [ "$snr" -lt 20 ]; then
+      row WARN "Wi-Fi noise" "SNR ${snr} dB (noise ${WIFI_NOISE} dBm)"
+      add_diag "Noisy radio environment (low SNR). Crowded channel or interference from other networks. Congestion is likely even if the signal bars look fine."
+    else
+      row PASS "Wi-Fi noise" "SNR ${snr} dB"
+    fi
+  fi
+
+  case "$WIFI_CHAN" in
+    *2GHz*) row INFO "Band" "2.4 GHz (shared with many networks, slower)" ;;
+  esac
+}
+
+report_gateway() {
+  if [ -z "$GW" ]; then
+    row FAIL "Router" "no default gateway"
+    add_diag "No router address. The Wi-Fi link isn't really up. Reconnect, or renew DHCP (Wi-Fi > Details > TCP/IP)."
+    GW_BAD=1
+    return
+  fi
+  local detail="$GW  loss ${GW_LOSS}%  avg ${GW_AVG} ms  jitter ${GW_JIT} ms"
+  if [ "$GW_AVG" = "-1" ]; then
+    # Many venue routers drop ICMP. Internet checks below decide if this is a real outage.
+    row WARN "Router" "$GW no ping reply (ICMP often blocked on public Wi-Fi)"
+    GW_UNKNOWN=1
+  elif gt "$GW_LOSS" 10 || gt "$GW_JIT" 40; then
+    row FAIL "Router" "$detail"
+    add_diag "The Wi-Fi link itself is unstable (heavy loss and jitter to the router). This is congestion or interference between you and the access point. Try another location or band, or wait it out."
+    GW_BAD=1
+  elif gt "$GW_LOSS" 2 || gt "$GW_JIT" 20 || gt "$GW_AVG" 30; then
+    row WARN "Router" "$detail"
+    add_diag "Wi-Fi is congested or noisy: responses from the router are slow and uneven."
+    GW_BAD=1
+  else
+    row PASS "Router" "$detail"
+  fi
+}
+
+report_upstream() {
+  UP_LOSS=$UP1_LOSS; UP_AVG=$UP1_AVG; UP_JIT=$UP1_JIT
+  if lt "$UP2_LOSS" "$UP_LOSS" || { [ "$UP_AVG" = "-1" ] && [ "$UP2_AVG" != "-1" ]; }; then
+    UP_LOSS=$UP2_LOSS; UP_AVG=$UP2_AVG; UP_JIT=$UP2_JIT
+  fi
+  local detail="loss ${UP_LOSS}%  avg ${UP_AVG} ms  jitter ${UP_JIT} ms"
+  if [ "$UP_AVG" = "-1" ]; then
+    row WARN "Internet" "no ping replies (ICMP may be blocked; see HTTP below)"
+    UP_BAD=1
+  elif gt "$UP_LOSS" 10 || gt "$UP_AVG" 300; then
+    row FAIL "Internet" "$detail"
+    UP_BAD=1
+  elif gt "$UP_LOSS" 2 || gt "$UP_AVG" 120 || gt "$UP_JIT" 50; then
+    row WARN "Internet" "$detail"
+    UP_BAD=1
+  else
+    row PASS "Internet" "$detail"
+  fi
+
+  if [ "$UP_BAD" -eq 1 ] && [ "$UP_AVG" != "-1" ]; then
+    if [ "$GW_BAD" -eq 0 ] && [ "$GW_UNKNOWN" -eq 0 ]; then
+      add_diag "Wi-Fi to the router is fine, but the path beyond it is slow or lossy (${UP_LOSS}% loss, ${UP_AVG} ms avg, ${UP_JIT} ms jitter). That points at the venue's internet link (congestion or throttling), not your radio."
+    else
+      add_diag "The internet path is slow or lossy (${UP_LOSS}% loss, ${UP_AVG} ms avg, ${UP_JIT} ms jitter). The router doesn't answer ping here, so the Wi-Fi hop and the venue link can't be separated. Congestion on the venue side is the likely cause."
+    fi
+  fi
+
+  if [ "$MTU_OK" -eq 0 ] && [ "$UP_AVG" != "-1" ]; then
+    row WARN "Large packets" "1472-byte unfragmented ping failed"
+    add_diag "Path MTU is below 1500 (a VPN or tunnel is likely). Some sites and uploads stall. If a VPN is on, it's often the cause."
+  fi
+}
+
+report_dns() {
+  if [ "$DNS_SYS_STATUS" != NOERROR ] || [ -z "$DNS_SYS_ADDR" ]; then
+    row FAIL "DNS" "resolver ${DNS_NS:-?} returned ${DNS_SYS_STATUS}"
+    add_diag "DNS is failing on this network. Set DNS manually to 1.1.1.1 (Wi-Fi > Details > DNS), or log in to the captive portal first."
+  elif gt "$DNS_SYS_MS" 200 && lt "$DNS_PUB_MS" 150; then
+    row WARN "DNS" "${DNS_SYS_MS} ms via ${DNS_NS} (public: ${DNS_PUB_MS} ms)"
+    add_diag "Slow DNS from the network's resolver: every new site pays this delay first. Switch to 1.1.1.1 or 8.8.8.8 in Wi-Fi > Details > DNS."
+  elif gt "$DNS_SYS_MS" 200; then
+    # Both resolvers are slow, so the path is slow. The internet check covers that.
+    row WARN "DNS" "${DNS_SYS_MS} ms via ${DNS_NS}, public ${DNS_PUB_MS} ms too (path latency)"
+  elif is_private "$DNS_SYS_ADDR" && [ -n "$DNS_PUB_ADDR" ] && ! is_private "$DNS_PUB_ADDR"; then
+    row WARN "DNS" "example.com -> private ${DNS_SYS_ADDR} via ${DNS_NS}"
+    add_diag "DNS is redirected to a private address. This is usually a captive portal, or the network is intercepting DNS."
+  else
+    row PASS "DNS" "${DNS_SYS_MS} ms via ${DNS_NS}"
+  fi
+}
+
+report_http() {
+  # Flag a portal only when both independent checks fail, to avoid one-off timeouts.
+  if [ "$CAP_APPLE" != ok ] && [ "$CAP_GSTATIC" != 204 ]; then
+    row WARN "Captive portal" "login page or redirect in the way (apple: ${CAP_APPLE}, gstatic: ${CAP_GSTATIC})"
+    add_diag "A captive portal may be in the way (plain-HTTP checks redirected or failed). If sites don't load, open a browser and sign in to this network."
+  elif [ "$CAP_APPLE" != ok ] || [ "$CAP_GSTATIC" != 204 ]; then
+    row INFO "Captive portal" "one check inconclusive (apple: ${CAP_APPLE}, gstatic: ${CAP_GSTATIC}); retry if pages fail"
+  else
+    row PASS "Captive portal" "none detected"
+  fi
+
+  if [ "$HTTP_CODE" != 200 ]; then
+    row FAIL "HTTPS" "test request failed (code ${HTTP_CODE})"
+    add_diag "HTTPS requests are failing. Check the portal first, then the other notes."
+  elif gt "$HTTP_TTFB" 1.5; then
+    row WARN "HTTPS" "first byte after ${HTTP_TTFB} s"
+    add_diag "Web requests are slow to start. That's usually DNS or a congested link (see the notes above)."
+  else
+    row PASS "HTTPS" "first byte after ${HTTP_TTFB} s"
+  fi
+
+  if [ -n "$TLS_ISSUER" ]; then
+    if printf '%s' "$TLS_ISSUER" | grep -qiE 'zscaler|fortinet|palo alto|sophos|blue ?coat|smoothwall|netsweeper|lightspeed|umbrella|securly|iboss|watchguard'; then
+      row WARN "TLS" "certificate issued by an inspection proxy"
+      add_diag "Your HTTPS traffic is being inspected by a proxy (issuer: ${TLS_ISSUER}). Don't sign in to sensitive accounts here without a VPN."
+    fi
+  fi
+
+  case "$V6" in
+    ok)     row PASS "IPv6" "working" ;;
+    broken) row WARN "IPv6" "address assigned, but IPv6 traffic fails"
+            add_diag "Broken IPv6 makes apps hang while they try it before falling back to IPv4. Set Wi-Fi > Details > TCP/IP > Configure IPv6 to Link-local only." ;;
+    *)      row INFO "IPv6" "no global address (IPv4 only)" ;;
+  esac
+}
+
+report_ports() {
+  local f blocked=""
+  for f in "$TMP"/port.*; do
+    [ -f "$f" ] || continue
+    if [ "$(cat "$f")" = closed ]; then blocked="$blocked ${f##*port.}"; fi
+  done
+  if [ -n "$blocked" ]; then
+    row WARN "Ports" "filtered:$blocked"
+    add_diag "Some ports are filtered:${blocked}. Common on public Wi-Fi. Mail, SSH and some apps need a VPN here."
+  else
+    row PASS "Ports" "web, DNS, mail, SSH reachable"
+  fi
+}
+
+# "304.462 Kbps" -> Mbps. Handles bps, Kbps, Mbps, Gbps.
+to_mbps() {
+  awk '{ v = $1 + 0; u = $2
+         if (u ~ /^K/) v /= 1000; else if (u ~ /^G/) v *= 1000; else if (u ~ /^b/) v /= 1000000
+         printf "%.1f\n", v }' <<< "$1"
+}
+
+# "1.4 seconds" or "12 milliseconds" -> ms
+to_ms() {
+  awk '{ v = $1 + 0; if ($2 ~ /^s/) v *= 1000; printf "%.0f\n", v }' <<< "$1"
+}
+
+run_speed() {
+  say ""
+  say "Running throughput test (about 15s, uses the full link)..."
+  networkQuality -s > "$TMP/speed.txt" 2>/dev/null
+  local f="$TMP/speed.txt" dl ul lat grade rpm detail
+  # Output format (macOS 12+): "Downlink capacity: 304.462 Kbps", "Idle Latency: 1.4 seconds | 42 RPM",
+  # "Uplink Responsiveness: Low (1.287 seconds | 46 RPM)". Units vary, so convert.
+  dl=$(sed -n 's/^Downlink capacity: *//p' "$f" | head -n 1)
+  ul=$(sed -n 's/^Uplink capacity: *//p' "$f" | head -n 1)
+  lat=$(sed -n 's/^Idle Latency: *//p' "$f" | head -n 1)
+  if [ -z "$dl" ] || [ -z "$ul" ]; then
+    row SKIP "Speed" "networkQuality returned no result"
+    return
+  fi
+  dl=$(to_mbps "$dl"); ul=$(to_mbps "$ul")
+  lat=$(to_ms "$lat")
+  if grep -q 'Responsiveness: *Low' "$f"; then
+    grade=Low
+  else
+    grade=$(sed -n 's/.*Responsiveness: *\([A-Za-z]*\).*/\1/p' "$f" | head -n 1)
+  fi
+  # Lowest RPM across the responsiveness lines = worst case under load (not the idle line).
+  rpm=$(grep 'Responsiveness' "$f" | sed -n 's/.*[|(] *\([0-9][0-9]*\) RPM.*/\1/p' | sort -n | head -n 1)
+  detail="down ${dl} / up ${ul} Mbps, idle ${lat:-?} ms, under load ${grade:-?} (${rpm:-?} RPM)"
+  if [ "$grade" = Low ]; then
+    row WARN "Speed" "$detail"
+    add_diag "Bufferbloat: latency balloons once the link is busy (${rpm} RPM under load). Congestion or poor queueing at the router or venue. Expect lag during big downloads and uploads."
+  elif lt "$dl" 5 || lt "$ul" 1; then
+    row WARN "Speed" "$detail"
+    add_diag "Low throughput with healthy latency: the link is capped or thinly shared (slow plan or backhaul), not interference. A different network is the only fix you control."
+  else
+    row PASS "Speed" "$detail"
+  fi
+}
+
+say ""
+say "$(printf '  %-4s  %-14s %s' LEVEL CHECK DETAIL)"
+report_wifi
+report_gateway
+report_upstream
+report_dns
+report_http
+report_ports
+
+# The throughput test is the only step that loads the link, so it's optional.
+DO_SPEED=0
+case "$SPEED_MODE" in
+  yes) DO_SPEED=1 ;;
+  ask)
+    if [ -t 0 ] && [ -t 1 ]; then
+      printf '\nRun the throughput test? It saturates the link for ~15s. [y/N] '
+      read -r ans
+      case "$ans" in y|Y|yes) DO_SPEED=1 ;; esac
+    fi
+    ;;
+esac
+[ "$DO_SPEED" -eq 1 ] && run_speed
+
+# ---------------------------------------------------------------------------
+# Verdict
+# ---------------------------------------------------------------------------
+say ""
+printf '%sVerdict%s\n' "$C_BOLD" "$C_OFF"
+if [ "$ISSUES" -eq 0 ]; then
+  echo "  Looks healthy. No Wi-Fi, congestion, DNS, portal or port problems found."
+  echo "  If one site is still slow, the problem is probably that site or its CDN."
+else
+  i=0
+  while [ "$i" -lt "${#DIAG[@]}" ]; do
+    echo "  - ${DIAG[$i]}"
+    i=$((i + 1))
+  done
+fi
