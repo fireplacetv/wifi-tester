@@ -205,13 +205,36 @@ GW=$(route -n get default 2>/dev/null | awk '/gateway:/ { print $2; exit }')
 # ---------------------------------------------------------------------------
 # Run the light checks in parallel.
 # ---------------------------------------------------------------------------
+# Details macOS doesn't redact: gateway MAC, DHCP domain, IPv6 prefix, security,
+# and the router model (ISPs put it in DHCP option 125). Quick, local reads only.
+network_details() {
+  local wif dhcp summary mac domain prefix sec model title
+  wif=$(networksetup -listallhardwareports 2>/dev/null | awk '/Wi-Fi|AirPort/ { getline; print $2; exit }')
+  wif=${wif:-en0}
+  dhcp=$(ipconfig getpacket "$wif" 2>/dev/null)
+  summary=$(ipconfig getsummary "$wif" 2>/dev/null)
+  mac=$(arp -n "$GW" 2>/dev/null | awk '{ print $4 }')
+  domain=$(printf '%s\n' "$dhcp" | sed -n 's/^domain_name (string): //p')
+  prefix=$(printf '%s\n' "$summary" | sed -n 's/.*prefix info option[^:]*: *\([0-9a-f:]*\/[0-9]*\).*/\1/p' | head -n 1)
+  sec=$(printf '%s\n' "$summary" | sed -n 's/.*Security : *//p' | head -n 1)
+  model=$(printf '%s\n' "$dhcp" | sed -n '/option_125/,/end (none)/p' | grep -oE '[A-Z]{2,4}[0-9]{3,}(-[0-9]+)?' | head -n 1)
+  if [ -z "$model" ] && [ -n "$GW" ]; then
+    title=$(curl -sk -m 2 "https://$GW/" 2>/dev/null | grep -o -i '<title>[^<]*' | head -n 1 | sed 's/<[Tt][Ii][Tt][Ll][Ee]>//')
+    [ -n "$title" ] && model="web title: $title"
+  fi
+  say "Router:   ${GW:-none}  MAC ${mac:-unknown}  model ${model:-unknown}"
+  say "Domain:   ${domain:-none}   IPv6 prefix: ${prefix:-none}"
+  say "Security: ${sec:-unknown}"
+}
+
 say "${C_BOLD}wifi-tester${C_OFF}  $(date '+%H:%M:%S')"
 WIFI_SSID=$(current_ssid)
 case "$WIFI_SSID" in
-  "") say "Network: not connected to Wi-Fi" ;;
-  "<redacted>") say "Network: hidden by macOS (allow Location Services for your terminal app to show it)" ;;
-  *) say "Network: $WIFI_SSID" ;;
+  "") say "Network:  not connected to Wi-Fi" ;;
+  "<redacted>") say "Network:  hidden by macOS (allow Location Services for your terminal app to show it)" ;;
+  *) say "Network:  $WIFI_SSID" ;;
 esac
+network_details
 say "Running light checks (about 10s)..."
 
 probe_wifi > "$TMP/wifi.env" &
