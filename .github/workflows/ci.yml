@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n wifi-tester
+
+      - name: Shellcheck (errors only)
+        # Warnings are not gated yet: the current script has unused-variable
+        # warnings (SC2034) and a non-constant source (SC1090).
+        run: shellcheck -S error wifi-tester
+
+      - name: Non-macOS guard refuses to run
+        # Until the Linux probes exist, the script must exit non-zero with the
+        # macOS message on Linux. This fails if the guard is removed before the
+        # Linux implementation is in place.
+        run: |
+          set +e
+          out=$(./wifi-tester --no-speed 2>&1)
+          code=$?
+          echo "$out"
+          [ "$code" -eq 1 ] || { echo "expected exit 1, got $code"; exit 1; }
+          case "$out" in
+            *"written for macOS"*) ;;
+            *) echo "missing macOS message"; exit 1 ;;
+          esac
+
+      - name: Help text runs on Linux
+        run: ./wifi-tester --help
