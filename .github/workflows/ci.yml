@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   linux:
-    name: Linux checks
+    name: Linux real run
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,23 +24,25 @@ jobs:
         # warnings (SC2034) and a non-constant source (SC1090).
         run: shellcheck -S error wifi-tester
 
-      - name: Non-macOS guard refuses to run
-        # Until the Linux probes exist, the script must exit non-zero with the
-        # macOS message on Linux. This fails if the guard is removed before the
-        # Linux implementation is in place.
+      - name: Install dig (dnsutils)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q dnsutils
+
+      - name: Help text runs on Linux
+        run: ./wifi-tester --help
+
+      - name: Run wifi-tester (no throughput test)
         run: |
           set +e
           out=$(./wifi-tester --no-speed 2>&1)
           code=$?
           echo "$out"
-          [ "$code" -eq 1 ] || { echo "expected exit 1, got $code"; exit 1; }
+          [ "$code" -eq 0 ] || { echo "wifi-tester exited $code"; exit 1; }
           case "$out" in
-            *"written for macOS"*) ;;
-            *) echo "missing macOS message"; exit 1 ;;
+            *Verdict*) ;;
+            *) echo "no verdict printed"; exit 1 ;;
           esac
-
-      - name: Help text runs on Linux
-        run: ./wifi-tester --help
 
   macos:
     name: macOS real run

@@ -3,7 +3,7 @@
 #
 # Runs light, layered checks in parallel (Wi-Fi radio -> router -> internet ->
 # DNS -> captive portal / TLS inspection -> ports), optionally a short
-# throughput test, then prints a verdict. Uses only built-in macOS tools.
+# throughput test, then prints a verdict. Uses standard CLI tools on each OS.
 set -u
 
 SPEED_MODE=ask   # ask | yes | no
@@ -38,7 +38,11 @@ done
 # platform probes, report logic, throughput test, verdict. Anything tagged
 # "platform:" needs its own implementation for each supported OS.
 OS=$(uname -s)
-[ "$OS" = Darwin ] || { echo "wifi-tester is written for macOS." >&2; exit 1; }
+case "$OS" in
+  Darwin) PING_WAIT=1000; PING_DF=-D ;;       # ping -W is ms; -D sets the DF bit
+  Linux)  PING_WAIT=1;    PING_DF="-M do" ;;  # ping -W is seconds; DF needs -M do
+  *) echo "wifi-tester supports macOS and Linux." >&2; exit 1 ;;
+esac
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/wifi-tester.XXXXXX") || exit 1
 trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$TMP"' EXIT
@@ -88,10 +92,76 @@ is_private() {
 # the results are sourced afterwards. Values are %q-quoted where they hold text.
 # ---------------------------------------------------------------------------
 
-# platform: macOS (system_profiler). Linux will use iw or nmcli.
+# ---- Platform: Linux ----
+# Each Linux helper fills the same variables as its macOS counterpart. A missing
+# tool leaves the value empty, which turns into a SKIP row rather than an error.
+
+# Current DNS resolver: systemd-resolved's upstream if present, else resolv.conf.
+dns_resolver() {
+  if [ "$OS" = Linux ]; then
+    local ns
+    ns=$(resolvectl status 2>/dev/null | awk '/Current DNS Server:/ { print $4; exit }')
+    [ -n "$ns" ] || ns=$(awk '/^nameserver/ { print $2; exit }' /etc/resolv.conf 2>/dev/null)
+    echo "$ns"
+  else
+    scutil --dns 2>/dev/null | awk '/nameserver\[0\]/ { print $3; exit }'
+  fi
+}
+
+# Default gateway address.
+default_gateway() {
+  if [ "$OS" = Linux ]; then
+    ip route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit } }'
+  else
+    route -n get default 2>/dev/null | awk '/gateway:/ { print $2; exit }'
+  fi
+}
+
+# A global (non link-local) IPv6 address, if the host has one.
+global_ipv6() {
+  if [ "$OS" = Linux ]; then
+    ip -6 addr show scope global 2>/dev/null | awk '$1 == "inet6" { split($2, a, "/"); print a[1]; exit }'
+  else
+    ifconfig 2>/dev/null | awk '/inet6 / && $2 !~ /^fe80/ && $2 != "::1" { print $2; exit }'
+  fi
+}
+
+# First wireless interface name, or empty if there is no Wi-Fi adapter.
+linux_wifi_if() { iw dev 2>/dev/null | awk '$1 == "Interface" { print $2; exit }'; }
+
+# Raw `iw dev IF link` output: "Not connected." or SSID, freq, signal, bitrate.
+linux_link() {
+  local wif
+  wif=$(linux_wifi_if)
+  [ -n "$wif" ] && iw dev "$wif" link 2>/dev/null
+  return 0
+}
+
+# Wi-Fi radio fields from `iw`. Noise and PHY mode aren't reported there, so they stay empty.
+probe_wifi_linux() {
+  local link rssi freq rate chan
+  link=$(linux_link)
+  rssi=$(printf '%s\n' "$link" | sed -n 's/^[[:space:]]*signal: *\(-*[0-9]*\) dBm.*/\1/p' | head -n 1)
+  freq=$(printf '%s\n' "$link" | sed -n 's/^[[:space:]]*freq: *\([0-9]*\).*/\1/p' | head -n 1)
+  rate=$(printf '%s\n' "$link" | sed -n 's/^[[:space:]]*tx bitrate: *//p' | head -n 1)
+  chan=$(awk -v f="$freq" 'BEGIN {
+    if (f == "") exit
+    if (f < 3000) printf "%d (2GHz)", (f - 2407) / 5
+    else if (f < 5950) printf "%d (5GHz)", (f - 5000) / 5
+    else printf "%d (6GHz)", (f - 5950) / 5
+  }')
+  printf 'WIFI_RSSI=%q\n' "$rssi"
+  printf "WIFI_NOISE=''\n"
+  printf 'WIFI_CHAN=%q\n' "$chan"
+  printf "WIFI_PHY=''\n"
+  printf 'WIFI_RATE=%q\n' "$rate"
+}
+
+# ---- Platform: macOS and the probes below that dispatch on $OS ----
 # Current network name. macOS prints <redacted> unless the terminal app has
 # Location Services permission. Read before the header so it prints first.
 current_ssid() {
+  if [ "$OS" = Linux ]; then linux_link | sed -n 's/^[[:space:]]*SSID: //p' | head -n 1; return; fi
   system_profiler SPAirPortDataType -detailLevel basic 2>/dev/null |
     grep -A 14 'Current Network Information:' | head -n 15 |
     sed -n '2p' | sed 's/^ *//; s/:$//'
@@ -100,6 +170,7 @@ current_ssid() {
 # platform: macOS (system_profiler). Linux will use iw or nmcli.
 # Wi-Fi radio: signal/noise, channel, PHY mode, link rate.
 probe_wifi() {
+  if [ "$OS" = Linux ]; then probe_wifi_linux; return; fi
   local info block rssi noise chan phy rate
   info=$(system_profiler SPAirPortDataType -detailLevel basic 2>/dev/null)
   block=$(printf '%s\n' "$info" | grep -A 14 'Current Network Information:' | head -n 15)
@@ -118,7 +189,7 @@ probe_wifi() {
 # Latency, loss and jitter (stddev of RTT) over 20 pings at 200 ms.
 probe_ping() { # HOST PREFIX
   local out loss rtt avg jit
-  out=$(ping -q -c 20 -i 0.2 -W 1000 "$1" 2>/dev/null)
+  out=$(ping -q -c 20 -i 0.2 -W "$PING_WAIT" "$1" 2>/dev/null)
   loss=$(printf '%s\n' "$out" | sed -n 's/.*, \([0-9.]*\)% packet loss.*/\1/p')
   rtt=$(printf '%s\n' "$out" | sed -n 's/.*= [0-9.]*\/\([0-9.]*\)\/[0-9.]*\/\([0-9.]*\) ms.*/\1 \2/p')
   avg=${rtt%% *}
@@ -130,7 +201,7 @@ probe_ping() { # HOST PREFIX
 
 # Can full-size (1500 byte) unfragmented packets cross the path?
 probe_mtu() {
-  if ping -q -c 3 -D -s 1472 -W 1000 1.1.1.1 >/dev/null 2>&1; then
+  if ping -q -c 3 $PING_DF -s 1472 -W "$PING_WAIT" 1.1.1.1 >/dev/null 2>&1; then
     echo "MTU_OK=1"
   else
     echo "MTU_OK=0"
@@ -147,12 +218,10 @@ dns_fields() { # OUTPUT_OF_DIG PREFIX
   printf '%s_ADDR=%q\n' "$2" "$addr"
 }
 
-# platform: the system resolver lookup (scutil, macOS) is platform-specific.
-# The dig queries are portable.
-# DNS: system resolver vs. 1.1.1.1, same name.
+# DNS: system resolver vs. 1.1.1.1, same name. The resolver comes from dns_resolver.
 probe_dns() {
   local ns s p
-  ns=$(scutil --dns 2>/dev/null | awk '/nameserver\[0\]/ { print $3; exit }')
+  ns=$(dns_resolver)
   s=$(dig +tries=1 +time=3 example.com A 2>/dev/null)
   p=$(dig +tries=1 +time=3 @1.1.1.1 example.com A 2>/dev/null)
   printf 'DNS_NS=%q\n' "$ns"
@@ -180,7 +249,7 @@ probe_http() {
   issuer=$(sed -n 's/^\* *issuer: //p' "$TMP/tls.log" 2>/dev/null | head -n 1)
   printf 'TLS_ISSUER=%q\n' "$issuer"
 
-  global6=$(ifconfig 2>/dev/null | awk '/inet6 / && $2 !~ /^fe80/ && $2 != "::1" { print $2; exit }')
+  global6=$(global_ipv6)
   v6=none
   if [ -n "$global6" ]; then
     code=$(curl -6 -s -o /dev/null -m 5 -w '%{http_code}' https://www.cloudflare.com/cdn-cgi/trace)
@@ -210,26 +279,32 @@ DNS_NS=""; DNS_SYS_STATUS=NONE; DNS_SYS_MS=-1; DNS_SYS_ADDR=""
 DNS_PUB_STATUS=NONE; DNS_PUB_MS=-1; DNS_PUB_ADDR=""
 CAP_APPLE=fail; CAP_GSTATIC=000; HTTP_TTFB=-1; HTTP_CODE=000; TLS_ISSUER=""; V6=none
 
-# platform: BSD route syntax. Linux will use "ip route show default".
-GW=$(route -n get default 2>/dev/null | awk '/gateway:/ { print $2; exit }')
+GW=$(default_gateway)
 
 # ---------------------------------------------------------------------------
 # Run the light checks in parallel.
 # ---------------------------------------------------------------------------
-# platform: macOS (ipconfig, networksetup, arp). Linux will use nmcli, ip and resolvectl.
-# Details macOS doesn't redact: gateway MAC, DHCP domain, IPv6 prefix, security,
+# Details the OS doesn't redact: gateway MAC, DHCP domain, IPv6 prefix, security,
 # and the router model (ISPs put it in DHCP option 125). Quick, local reads only.
 network_details() {
   local wif dhcp summary mac domain prefix sec model title
-  wif=$(networksetup -listallhardwareports 2>/dev/null | awk '/Wi-Fi|AirPort/ { getline; print $2; exit }')
-  wif=${wif:-en0}
-  dhcp=$(ipconfig getpacket "$wif" 2>/dev/null)
-  summary=$(ipconfig getsummary "$wif" 2>/dev/null)
-  mac=$(arp -n "$GW" 2>/dev/null | awk '{ print $4 }')
-  domain=$(printf '%s\n' "$dhcp" | sed -n 's/^domain_name (string): //p')
-  prefix=$(printf '%s\n' "$summary" | sed -n 's/.*prefix info option[^:]*: *\([0-9a-f:]*\/[0-9]*\).*/\1/p' | head -n 1)
-  sec=$(printf '%s\n' "$summary" | sed -n 's/.*Security : *//p' | head -n 1)
-  model=$(printf '%s\n' "$dhcp" | sed -n '/option_125/,/end (none)/p' | grep -oE '[A-Z]{2,4}[0-9]{3,}(-[0-9]+)?' | head -n 1)
+  if [ "$OS" = Linux ]; then
+    mac=$(ip neigh show "$GW" 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") { print $(i + 1); exit } }')
+    domain=$(sed -n 's/^search //p' /etc/resolv.conf 2>/dev/null | awk '{ print $1; exit }')
+    prefix=$(ip -6 route show proto ra 2>/dev/null | awk '{ print $1; exit }')
+    sec=$(nmcli -t -f ACTIVE,SECURITY dev wifi 2>/dev/null | awk -F: '$1 == "yes" { print $2; exit }')
+    model=""
+  else
+    wif=$(networksetup -listallhardwareports 2>/dev/null | awk '/Wi-Fi|AirPort/ { getline; print $2; exit }')
+    wif=${wif:-en0}
+    dhcp=$(ipconfig getpacket "$wif" 2>/dev/null)
+    summary=$(ipconfig getsummary "$wif" 2>/dev/null)
+    mac=$(arp -n "$GW" 2>/dev/null | awk '{ print $4 }')
+    domain=$(printf '%s\n' "$dhcp" | sed -n 's/^domain_name (string): //p')
+    prefix=$(printf '%s\n' "$summary" | sed -n 's/.*prefix info option[^:]*: *\([0-9a-f:]*\/[0-9]*\).*/\1/p' | head -n 1)
+    sec=$(printf '%s\n' "$summary" | sed -n 's/.*Security : *//p' | head -n 1)
+    model=$(printf '%s\n' "$dhcp" | sed -n '/option_125/,/end (none)/p' | grep -oE '[A-Z]{2,4}[0-9]{3,}(-[0-9]+)?' | head -n 1)
+  fi
   if [ -z "$model" ] && [ -n "$GW" ]; then
     title=$(curl -sk -m 2 "https://$GW/" 2>/dev/null | grep -o -i '<title>[^<]*' | head -n 1 | sed 's/<[Tt][Ii][Tt][Ll][Ee]>//')
     [ -n "$title" ] && model="web title: $title"
@@ -275,7 +350,7 @@ UP_BAD=0
 
 report_wifi() {
   if [ -z "$WIFI_RSSI" ]; then
-    row SKIP "Wi-Fi" "no signal data (macOS hides it when not associated)"
+    row SKIP "Wi-Fi" "no signal data (not associated, or no Wi-Fi adapter)"
     return
   fi
   local detail="${WIFI_RSSI} dBm, ${WIFI_CHAN:-channel ?}, ${WIFI_PHY:-PHY ?}"
@@ -442,8 +517,12 @@ to_ms() {
   awk '{ v = $1 + 0; if ($2 ~ /^s/) v *= 1000; printf "%.0f\n", v }' <<< "$1"
 }
 
-# platform: macOS networkQuality. Linux has no built-in equivalent.
+# Throughput test uses networkQuality, which only macOS ships. Linux reports SKIP.
 run_speed() {
+  if [ "$OS" = Linux ]; then
+    row SKIP "Speed" "throughput test not implemented on Linux yet"
+    return
+  fi
   say ""
   say "Running throughput test (about 15s, uses the full link)..."
   networkQuality -s > "$TMP/speed.txt" 2>/dev/null
