@@ -41,3 +41,23 @@ jobs:
 
       - name: Help text runs on Linux
         run: ./wifi-tester --help
+
+  macos:
+    name: macOS real run
+    # The real test runs here: the probes only exist for macOS today.
+    # The throughput test is skipped (--no-speed), so no link saturation in CI.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run wifi-tester (no throughput test)
+        run: |
+          set +e
+          out=$(./wifi-tester --no-speed 2>&1)
+          code=$?
+          echo "$out"
+          [ "$code" -eq 0 ] || { echo "wifi-tester exited $code"; exit 1; }
+          case "$out" in
+            *Verdict*) ;;
+            *) echo "no verdict printed"; exit 1 ;;
+          esac
