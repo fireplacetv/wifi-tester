@@ -138,12 +138,13 @@ default_gateway() {
   fi
 }
 
-# A global (non link-local) IPv6 address, if the host has one.
+# A globally routable IPv6 address (2000::/3), if the host has one. Unique-local
+# fd00::/8 addresses are not routable, so they don't count.
 global_ipv6() {
   if [ "$OS" = Linux ]; then
-    ip -6 addr show scope global 2>/dev/null | awk '$1 == "inet6" { split($2, a, "/"); print a[1]; exit }'
+    ip -6 addr show scope global 2>/dev/null | awk '$1 == "inet6" && $2 ~ /^[23]/ { split($2, a, "/"); print a[1]; exit }'
   else
-    ifconfig 2>/dev/null | awk '/inet6 / && $2 !~ /^fe80/ && $2 != "::1" { print $2; exit }'
+    ifconfig 2>/dev/null | awk '$1 == "inet6" && $2 ~ /^[23]/ { print $2; exit }'
   fi
 }
 
@@ -343,10 +344,13 @@ case "$WIFI_SSID" in
   *) say "Network:  $WIFI_SSID" ;;
 esac
 network_details
-say "Running light checks (about 10s)..."
+say "Running light checks (about 14s)..."
+
+# Gateway ping runs alone, before the rest. The parallel probes load the same
+# Wi-Fi link, so measuring the router alongside them reads our own traffic as lag.
+[ -n "$GW" ] && probe_ping "$GW" GW > "$TMP/gw.env"
 
 probe_wifi > "$TMP/wifi.env" &
-if [ -n "$GW" ]; then probe_ping "$GW" GW > "$TMP/gw.env" & fi
 probe_ping 1.1.1.1 UP1 > "$TMP/up1.env" &
 probe_ping 8.8.8.8 UP2 > "$TMP/up2.env" &
 probe_mtu > "$TMP/mtu.env" &
