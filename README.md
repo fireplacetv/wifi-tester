@@ -35,12 +35,25 @@ about 15 seconds) saturates the link, so it is opt-in.
 
 ## Reading the verdict
 
+The verdict lists the most serious findings first. The thresholds are rules of
+thumb, not calibrated values, so treat a single borderline warning as a lead.
+
 - **Router no reply but internet OK**: many public routers drop ping. The script
   then can't tell radio problems from venue-link problems, and says so.
 - **Router OK, internet bad**: the problem is beyond the access point. The venue's
   link is congested or throttled.
-- **Router bad**: the Wi-Fi link is congested or noisy between you and the AP.
-  Try another location or band.
+- **Router slow but radio fine**: ping alone can't tell the air from a busy
+  router. The script says so and does not blame the Wi-Fi link.
+- **Router bad with weak radio**: the Wi-Fi link is congested or noisy between
+  you and the AP. Try another location or band.
+- **Large packets fail**: if a tunnel interface (VPN or Private Relay) has a
+  smaller MTU, the script names it. With no tunnel, the smaller MTU is probably
+  on the link itself, and nothing on your Mac will fix it.
+- **No throughput test**: the default run doesn't measure speed or bufferbloat,
+  and the verdict says so. Use `--speed` to check them.
+- **Comparing with your phone**: when the verdict finds problems, it suggests
+  running the test on your phone's hotspot. If the hotspot is clearly faster,
+  the problem is this network, not your device.
 - **Speed Low responsiveness (bufferbloat)**: latency spikes once the link is
   busy. Congestion or poor queueing on the venue side causes lag during large
   transfers.
