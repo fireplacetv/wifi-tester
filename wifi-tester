@@ -50,8 +50,10 @@ say() { [ "$QUIET" -eq 0 ] && printf '%s\n' "$*"; return 0; }
 
 # row LEVEL CHECK DETAIL: one line of the results table; WARN/FAIL count as issues.
 ISSUES=0
+LAST_LEVEL=PASS
 row() {
   local c="$C_OK"
+  LAST_LEVEL="$1"
   case "$1" in
     WARN) c="$C_WARN"; ISSUES=$((ISSUES + 1)) ;;
     FAIL) c="$C_FAIL"; ISSUES=$((ISSUES + 1)) ;;
@@ -61,9 +63,19 @@ row() {
   return 0
 }
 
-# Likely causes, in the order they were found. Printed in the verdict.
+# Likely causes. Each is recorded with the level of the row it explains (add_diag
+# is always called right after its row), so the verdict can show the worst first.
 DIAG=()
-add_diag() { DIAG[${#DIAG[@]}]="$1"; }
+DIAG_LEVEL=()
+add_diag() {
+  DIAG[${#DIAG[@]}]="$1"
+  DIAG_LEVEL[${#DIAG_LEVEL[@]}]="$LAST_LEVEL"
+}
+
+# Set when the radio itself (signal or noise) is weak; see report_wifi.
+RADIO_BAD=0
+# Set when the throughput test runs; the verdict says so when it does not.
+SPEED_RAN=0
 
 # Float comparisons: gt A B  -> A > B ; lt A B -> A < B
 gt() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 > b + 0) }'; }
@@ -75,6 +87,15 @@ is_private() {
     10.*|192.168.*|127.*|169.254.*|0.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# Names of utun (tunnel) interfaces with an MTU below 1500, space separated.
+# VPNs and Private Relay create these; macOS also keeps some idle utun devices.
+small_tunnels() {
+  ifconfig 2>/dev/null | awk '/^utun/ {
+    name = $1; sub(/:$/, "", name)
+    for (i = 1; i <= NF; i++) if ($i == "mtu" && $(i + 1) + 0 < 1500) { printf "%s ", name; break }
+  }' | sed 's/ $//'
 }
 
 # ---------------------------------------------------------------------------
@@ -269,9 +290,11 @@ report_wifi() {
   local detail="${WIFI_RSSI} dBm, ${WIFI_CHAN:-channel ?}, ${WIFI_PHY:-PHY ?}"
   if [ "$WIFI_RSSI" -le -75 ]; then
     row FAIL "Wi-Fi signal" "$detail"
+    RADIO_BAD=1
     add_diag "Weak Wi-Fi signal. You're far from the access point or behind obstacles. Move closer or change position."
   elif [ "$WIFI_RSSI" -le -70 ]; then
     row WARN "Wi-Fi signal" "$detail"
+    RADIO_BAD=1
     add_diag "Marginal Wi-Fi signal. This drops rate and retries, which slows everything. Moving closer usually helps."
   else
     row PASS "Wi-Fi signal" "$detail"
@@ -281,6 +304,7 @@ report_wifi() {
     local snr=$(( WIFI_RSSI - WIFI_NOISE ))
     if [ "$snr" -lt 20 ]; then
       row WARN "Wi-Fi noise" "SNR ${snr} dB (noise ${WIFI_NOISE} dBm)"
+      RADIO_BAD=1
       add_diag "Noisy radio environment (low SNR). Crowded channel or interference from other networks. Congestion is likely even if the signal bars look fine."
     else
       row PASS "Wi-Fi noise" "SNR ${snr} dB"
@@ -310,7 +334,13 @@ report_gateway() {
     GW_BAD=1
   elif gt "$GW_LOSS" 2 || gt "$GW_JIT" 20 || gt "$GW_AVG" 30; then
     row WARN "Router" "$detail"
-    add_diag "Wi-Fi is congested or noisy: responses from the router are slow and uneven."
+    if [ "$RADIO_BAD" -eq 1 ]; then
+      add_diag "Wi-Fi is congested or noisy: responses from the router are slow and uneven, and the radio readings above are weak too."
+    else
+      # Radio looks fine, so this is ping-level evidence only. A busy router
+      # answers slowly too, and the radio can't be blamed from ping alone.
+      add_diag "The router answers slowly and unevenly, but the radio readings are fine. That's more likely router load (or ICMP deprioritized) than the air. Treat it as a lead, not a verdict."
+    fi
     GW_BAD=1
   else
     row PASS "Router" "$detail"
@@ -346,7 +376,13 @@ report_upstream() {
 
   if [ "$MTU_OK" -eq 0 ] && [ "$UP_AVG" != "-1" ]; then
     row WARN "Large packets" "1472-byte unfragmented ping failed"
-    add_diag "Path MTU is below 1500 (a VPN or tunnel is likely). Some sites and uploads stall. If a VPN is on, it's often the cause."
+    local tuns
+    tuns=$(small_tunnels)
+    if [ -n "$tuns" ]; then
+      add_diag "Path MTU is below 1500, and tunnel interface(s) ${tuns} have a smaller MTU, so a VPN or Private Relay is the likely cause. Some sites and uploads stall. Turning the VPN off (or testing without it) will confirm."
+    else
+      add_diag "Path MTU is below 1500, but no tunnel is active. The smaller MTU is probably on the link itself (for example PPPoE on a DSL or fiber ISP). Some sites and uploads stall. Nothing on this Mac is likely to fix it."
+    fi
   fi
 }
 
@@ -433,6 +469,7 @@ to_ms() {
 run_speed() {
   say ""
   say "Running throughput test (about 15s, uses the full link)..."
+  SPEED_RAN=1
   networkQuality -s > "$TMP/speed.txt" 2>/dev/null
   local f="$TMP/speed.txt" dl ul lat grade rpm detail
   # Output format (macOS 12+): "Downlink capacity: 304.462 Kbps", "Idle Latency: 1.4 seconds | 42 RPM",
@@ -494,12 +531,21 @@ esac
 say ""
 printf '%sVerdict%s\n' "$C_BOLD" "$C_OFF"
 if [ "$ISSUES" -eq 0 ]; then
-  echo "  Looks healthy. No Wi-Fi, congestion, DNS, portal or port problems found."
+  echo "  Looks healthy. No Wi-Fi, DNS, portal or port problems found."
+  if [ "$SPEED_RAN" -eq 0 ]; then
+    echo "  Throughput and bufferbloat were not measured. Run with --speed to check them."
+  fi
   echo "  If one site is still slow, the problem is probably that site or its CDN."
 else
-  i=0
-  while [ "$i" -lt "${#DIAG[@]}" ]; do
-    echo "  - ${DIAG[$i]}"
-    i=$((i + 1))
+  # Worst first: FAIL findings, then WARN.
+  for lvl in FAIL WARN; do
+    i=0
+    while [ "$i" -lt "${#DIAG[@]}" ]; do
+      [ "${DIAG_LEVEL[$i]}" = "$lvl" ] && echo "  - ${DIAG[$i]}"
+      i=$((i + 1))
+    done
   done
+  echo ""
+  echo "  To tell this network from your device, run ./wifi-tester --speed on your"
+  echo "  phone's hotspot. If the hotspot is clearly faster, the problem is this network."
 fi
