@@ -558,6 +558,7 @@ to_ms() {
 }
 
 # Throughput test uses networkQuality, which only macOS ships. Linux reports SKIP.
+SPEED_TIMEOUT=60
 run_speed() {
   if [ "$OS" = Linux ]; then
     row SKIP "Speed" "throughput test not implemented on Linux yet"
@@ -566,7 +567,23 @@ run_speed() {
   say ""
   say "Running throughput test (about 15s, uses the full link)..."
   SPEED_RAN=1
-  networkQuality -s > "$TMP/speed.txt" 2>/dev/null
+  # A dead or badly degraded link can hang networkQuality, so cap the wait.
+  # macOS has no timeout(1), so poll the background job and kill it at the deadline.
+  local nq waited=0
+  networkQuality -s > "$TMP/speed.txt" 2>/dev/null &
+  nq=$!
+  while kill -0 "$nq" 2>/dev/null; do
+    if [ "$waited" -ge "$SPEED_TIMEOUT" ]; then
+      kill "$nq" 2>/dev/null
+      wait "$nq" 2>/dev/null
+      SPEED_RAN=0
+      row SKIP "Speed" "networkQuality timed out after ${SPEED_TIMEOUT}s"
+      return
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$nq" 2>/dev/null
   local f="$TMP/speed.txt" dl ul lat grade rpm detail
   # Output format (macOS 12+): "Downlink capacity: 304.462 Kbps", "Idle Latency: 1.4 seconds | 42 RPM",
   # "Uplink Responsiveness: Low (1.287 seconds | 46 RPM)". Units vary, so convert.
